@@ -1,0 +1,370 @@
+/*
+  Motion-tracking pan turret WITH live web view
+  Board : Freenove ESP32-S3 WROOM CAM (OV2640)
+  Core  : Arduino-ESP32 3.x
+
+  What it does
+    - Tracks motion and pans the servo toward it (same logic as motion_tracker).
+    - Serves a web page showing the live grayscale picture:
+        white pixels  = pixels that moved
+        blue line     = centre of the image (shaded band = deadband, no movement)
+        red line      = where the tracker thinks the target is
+    - Buttons on the page turn tracking on/off and re-centre the servo.
+
+  Setup
+    1. Fill in WIFI_SSID and WIFI_PASS below (2.4 GHz network only).
+    2. Tools: ESP32S3 Dev Module, Flash 8MB, PSRAM = OPI PSRAM.
+    3. Upload, open the Serial Monitor (115200), and read the address it prints.
+    4. Open that address in a browser on the same Wi-Fi.
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "img_converters.h"
+
+// ------------------------------------------------------------------
+// Wi-Fi
+// ------------------------------------------------------------------
+const char *WIFI_SSID = "YOUR_WIFI_NAME";
+const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// ------------------------------------------------------------------
+// Servo
+// ------------------------------------------------------------------
+#define SERVO_PIN       14
+#define SERVO_CHANNEL   4       // keep away from the camera's LEDC channel 0
+#define SERVO_FREQ      50
+#define SERVO_BITS      14
+#define SERVO_MIN_US    1000
+#define SERVO_MAX_US    2000
+#define DIRECTION       1       // change to -1 if the camera turns away from you
+
+// ------------------------------------------------------------------
+// Camera pins (Freenove ESP32-S3 WROOM CAM)
+// ------------------------------------------------------------------
+#define PWDN_GPIO_NUM   -1
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   15
+#define SIOD_GPIO_NUM    4
+#define SIOC_GPIO_NUM    5
+#define Y9_GPIO_NUM     16
+#define Y8_GPIO_NUM     17
+#define Y7_GPIO_NUM     18
+#define Y6_GPIO_NUM     12
+#define Y5_GPIO_NUM     10
+#define Y4_GPIO_NUM      8
+#define Y3_GPIO_NUM      9
+#define Y2_GPIO_NUM     11
+#define VSYNC_GPIO_NUM   6
+#define HREF_GPIO_NUM    7
+#define PCLK_GPIO_NUM   13
+
+// ------------------------------------------------------------------
+// Tracker settings (copy over any values you tuned in motion_tracker)
+// ------------------------------------------------------------------
+// Frame size. W and H must match FRAME_SIZE:
+//   FRAMESIZE_QVGA  = 320x240 (sharper picture)
+//   FRAMESIZE_QQVGA = 160x120 (faster, blockier)
+#define FRAME_SIZE      FRAMESIZE_QVGA
+const int   W = 320;
+const int   H = 240;
+const int   PIXEL_THRESH   = 25;
+const int   MIN_COUNT      = (W * H) / 240;        // about 0.4% of the frame
+const int   MAX_COUNT      = (W * H) * 28 / 100;   // about 28% of the frame
+const int   DEADBAND_PX    = W * 3 / 40;           // 12 px at 160 wide, 24 at 320
+const float GAIN_US_PER_PX = 160.0f / W;           // 1.0 at 160 wide, 0.5 at 320
+const int   MAX_STEP_US    = 40;
+const int   SETTLE_FRAMES  = 4;
+
+// ------------------------------------------------------------------
+// State
+// ------------------------------------------------------------------
+static uint8_t *prevFrame = nullptr;   // previous raw frame (allocated in PSRAM)
+static uint8_t *viewFrame = nullptr;   // frame sent to the browser (moving pixels in white)
+static bool    havePrev        = false;
+static int     settleLeft      = 0;
+static int     servoUs         = (SERVO_MIN_US + SERVO_MAX_US) / 2;
+static bool    trackingEnabled = true;
+static int     lastCx          = -1;   // -1 = no valid target
+static int     lastCount       = 0;
+
+WebServer server(80);
+
+// ------------------------------------------------------------------
+// Web page
+// ------------------------------------------------------------------
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pan Tracker</title>
+<style>
+body{font-family:sans-serif;background:#111;color:#eee;text-align:center;margin:0;padding:12px}
+canvas{max-width:100%;height:auto;background:#000;border:1px solid #444}
+button{font-size:16px;padding:10px 16px;margin:6px;border-radius:8px;border:0}
+</style></head><body>
+<h3>Motion tracker</h3>
+<canvas id="c" width="640" height="480"></canvas><br>
+<button id="trk" onclick="toggle()">Tracking: ...</button>
+<button onclick="fetch('/center')">Center servo</button>
+<p id="info">connecting...</p>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let tracking=true;
+function toggle(){fetch('/track?on='+(tracking?0:1));}
+async function tick(){
+ try{
+  const r=await fetch('/frame.jpg?'+Date.now());
+  const cx=parseInt(r.headers.get('X-Cx'));
+  const sc=parseInt(r.headers.get('X-Scale'));
+  const dead=parseInt(r.headers.get('X-Dead'))*sc;
+  const cnt=r.headers.get('X-Count'),us=r.headers.get('X-Servo'),st=r.headers.get('X-State');
+  tracking=r.headers.get('X-Track')==='1';
+  const bmp=await createImageBitmap(await r.blob());
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(bmp,0,0,640,480);
+  ctx.fillStyle='rgba(80,160,255,0.15)';ctx.fillRect(320-dead,0,dead*2,480);
+  ctx.strokeStyle='#4aa3ff';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(320,0);ctx.lineTo(320,480);ctx.stroke();
+  if(cx>=0){ctx.strokeStyle='#ff4040';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(cx*sc+sc/2,0);ctx.lineTo(cx*sc+sc/2,480);ctx.stroke();}
+  document.getElementById('trk').textContent='Tracking: '+(tracking?'ON':'OFF');
+  document.getElementById('info').textContent=st+'   moving pixels '+cnt+'   servo '+us+' us';
+ }catch(e){}
+ setTimeout(tick,60);
+}
+tick();
+</script></body></html>
+)rawliteral";
+
+// ------------------------------------------------------------------
+// Servo helpers
+// ------------------------------------------------------------------
+void servoWriteUs(int us) {
+  us = constrain(us, SERVO_MIN_US, SERVO_MAX_US);
+  uint32_t duty = (uint32_t)us * ((1UL << SERVO_BITS) - 1) / 20000UL;
+  ledcWrite(SERVO_PIN, duty);
+}
+
+// ------------------------------------------------------------------
+// Camera setup
+// ------------------------------------------------------------------
+bool initCamera() {
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size   = FRAME_SIZE;
+  config.jpeg_quality = 12;
+  config.fb_count     = 2;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------
+// Web handlers
+// ------------------------------------------------------------------
+void handleRoot() {
+  server.send(200, "text/html", PAGE);
+}
+
+void handleFrame() {
+  uint8_t *jpg = nullptr;
+  size_t jpgLen = 0;
+  if (!fmt2jpg(viewFrame, W * H, W, H, PIXFORMAT_GRAYSCALE, 80, &jpg, &jpgLen)) {
+    server.send(500, "text/plain", "JPEG encode failed");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Scale", String(640 / W));
+  server.sendHeader("X-Cx", String(lastCx));
+  server.sendHeader("X-Count", String(lastCount));
+  server.sendHeader("X-Servo", String(servoUs));
+  server.sendHeader("X-Track", trackingEnabled ? "1" : "0");
+  server.sendHeader("X-State", settleLeft > 0 ? "SETTLING" : "MEASURING");
+  server.sendHeader("X-Dead", String(DEADBAND_PX));
+  server.setContentLength(jpgLen);
+  server.send(200, "image/jpeg", "");
+  server.client().write(jpg, jpgLen);
+  free(jpg);
+}
+
+void handleTrack() {
+  if (server.hasArg("on")) trackingEnabled = (server.arg("on") == "1");
+  server.send(200, "text/plain", "ok");
+}
+
+void handleCenter() {
+  servoUs = (SERVO_MIN_US + SERVO_MAX_US) / 2;
+  servoWriteUs(servoUs);
+  settleLeft = SETTLE_FRAMES;
+  server.send(200, "text/plain", "ok");
+}
+
+// ------------------------------------------------------------------
+// One tracker step: grab a frame, find motion, move the servo
+// ------------------------------------------------------------------
+void trackerStep() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    delay(20);
+    return;
+  }
+  if (fb->width != W || fb->height != H) {
+    Serial.printf("Unexpected frame size %dx%d\n", fb->width, fb->height);
+    esp_camera_fb_return(fb);
+    delay(200);
+    return;
+  }
+
+  const uint8_t *cur = fb->buf;
+  const bool analyse = havePrev && (settleLeft == 0);
+
+  uint32_t count = 0;
+  uint32_t sumX  = 0;
+  if (analyse) {
+    for (int i = 0; i < W * H; i++) {
+      int d = (int)cur[i] - (int)prevFrame[i];
+      if (d < 0) d = -d;
+      if (d > PIXEL_THRESH) {
+        count++;
+        sumX += i % W;
+        viewFrame[i] = 255;          // show moving pixels in white
+      } else {
+        viewFrame[i] = cur[i];
+      }
+    }
+  } else {
+    memcpy(viewFrame, cur, W * H);
+  }
+
+  memcpy(prevFrame, cur, W * H);
+  havePrev = true;
+  esp_camera_fb_return(fb);
+
+  if (settleLeft > 0) {
+    settleLeft--;
+    lastCx = -1;
+    return;
+  }
+  if (!analyse) return;
+
+  lastCount = (int)count;
+  const bool valid = ((int)count >= MIN_COUNT && (int)count <= MAX_COUNT);
+  lastCx = valid ? (int)(sumX / count) : -1;
+
+  static int printCounter = 0;
+  if (++printCounter >= 10) {
+    printCounter = 0;
+    Serial.printf("moving pixels=%d  servo=%d us\n", lastCount, servoUs);
+  }
+
+  if (!valid) return;
+
+  const int error = lastCx - W / 2;
+  if (abs(error) <= DEADBAND_PX) return;
+  if (!trackingEnabled) return;
+
+  int step = (int)(error * GAIN_US_PER_PX);
+  step = constrain(step, -MAX_STEP_US, MAX_STEP_US);
+
+  servoUs = constrain(servoUs + DIRECTION * step, SERVO_MIN_US, SERVO_MAX_US);
+  servoWriteUs(servoUs);
+  Serial.printf("cx=%d error=%d -> servo=%d us\n", lastCx, error, servoUs);
+
+  settleLeft = SETTLE_FRAMES;
+}
+
+// ------------------------------------------------------------------
+// Arduino entry points
+// ------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  ledcAttachChannel(SERVO_PIN, SERVO_FREQ, SERVO_BITS, SERVO_CHANNEL);
+  servoUs = (SERVO_MIN_US + SERVO_MAX_US) / 2;
+  servoWriteUs(servoUs);
+
+  if (!psramFound()) {
+    Serial.println("PSRAM not found. Set Tools > PSRAM to OPI PSRAM and upload again.");
+  }
+  prevFrame = (uint8_t *)ps_malloc(W * H);
+  viewFrame = (uint8_t *)ps_malloc(W * H);
+  if (!prevFrame || !viewFrame) {
+    Serial.println("Could not allocate frame buffers. Set Tools > PSRAM to OPI PSRAM.");
+    while (true) delay(1000);
+  }
+  memset(prevFrame, 0, W * H);
+  memset(viewFrame, 0, W * H);
+
+  if (!initCamera()) {
+    Serial.println("Stopping. Check the ribbon cable, PSRAM setting and pin numbers.");
+    while (true) delay(1000);
+  }
+  Serial.printf("Camera OK. Tracking at %dx%d.\n", W, H);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setSleep(false);
+  Serial.print("Wi-Fi connecting");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Open http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Wi-Fi not connected. Tracking still works, but there is no web view.");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/frame.jpg", handleFrame);
+  server.on("/track", handleTrack);
+  server.on("/center", handleCenter);
+  server.begin();
+
+  delay(500);
+}
+
+void loop() {
+  trackerStep();
+  server.handleClient();
+
+  // Reprint the address every 10 seconds so it is easy to find
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 10000) {
+    lastPrint = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Open http://");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("Wi-Fi not connected");
+    }
+  }
+}
