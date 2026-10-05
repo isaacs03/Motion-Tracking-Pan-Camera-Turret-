@@ -1,2 +1,2 @@
 # Motion-Tracking-Pan-Camera-Turret-
-Tracks motion and pans the servo toward it (same logic as motion_tracker).
+Tracks motion and pans the servo toward it.
